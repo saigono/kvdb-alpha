@@ -26,19 +26,20 @@ fn build_index(file_path: &String) -> Result<HashMap<String, u64>, std::io::Erro
     let mut current_position: u64 = 0;
     for line in buf_reader.lines() {
         let real_line = line?;
-        let (line_key, _) = real_line
-            .split_once(',')
-            .expect("Failed to split line [{}].\nCheck for db corruption");
+        let (line_key, _) = real_line.split_once(',').expect(
+            format!(
+                "Failed to split line [{}].\nCheck for db corruption",
+                real_line
+            )
+            .as_str(),
+        );
         result.insert(line_key.to_string(), current_position);
         current_position += real_line.len() as u64 + 1; // accounting newline here
     }
     return Ok(result);
 }
 
-fn get_data(
-    env: &Environment,
-    key: &String
-) -> Result<String, std::io::Error> {
+fn get_data(env: &Environment, key: &String) -> Result<String, std::io::Error> {
     let file = OpenOptions::new().read(true).open(&env.file_path)?;
     let mut buf_reader = BufReader::new(file);
     let mut return_value = String::new();
@@ -47,9 +48,13 @@ fn get_data(
             let _ = buf_reader.seek(SeekFrom::Start(*offset as u64));
             let mut real_line = String::new();
             let _ = buf_reader.read_line(&mut real_line)?;
-            let (line_key, val) = real_line
-                .split_once(',')
-                .expect("Failed to split line [{}].\nCheck for db corruption");
+            let (line_key, val) = real_line.split_once(',').expect(
+                format!(
+                    "Failed to split line [{}].\nCheck for db corruption",
+                    real_line
+                )
+                .as_str(),
+            );
             if line_key == key {
                 return_value = String::from(val);
                 return_value.pop(); // remove endline
@@ -57,7 +62,7 @@ fn get_data(
                 panic!("index corrupted");
             }
         }
-        None => ()
+        None => (),
     };
     Ok(return_value)
 }
@@ -70,7 +75,10 @@ fn set_data(env: &mut Environment, key: &String, value: &String) -> Result<(), s
     let mut writer = BufWriter::new(file);
     let line = format!("{},{}", key, value);
     writeln!(writer, "{}", line)?;
-    env.index.insert(key.clone(), writer.stream_position()? - line.len() as u64 - 1);
+    env.index.insert(
+        key.clone(),
+        writer.stream_position()? - line.len() as u64 - 1,
+    );
     Ok(())
 }
 
@@ -110,7 +118,7 @@ fn main() -> std::io::Result<()> {
     let is_interactive = args[0] == "--interactive";
     let mut env = Environment::new(&String::from("./test.db"));
     if !is_interactive {
-        handle_command(& mut env, &args);
+        handle_command(&mut env, &args);
         return Ok(());
     }
     let stdin = stdin();
