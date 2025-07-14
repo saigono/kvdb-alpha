@@ -1,20 +1,65 @@
 use std::collections::HashMap;
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{metadata, read_dir, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Seek, stdin};
 use std::io::{SeekFrom, prelude::*};
+use std::path::Path;
 
-struct Environment {
+const SEGMENT_THRESHOLD: u64 = 256;
+
+#[derive(Debug)]
+struct Segment {
     file_path: String,
     index: HashMap<String, u64>,
+    size: u64,
+}
+
+impl Segment {
+    pub fn new(file_path: String) -> Self {
+        let path = Path::new(&file_path);
+        if !path.exists() {
+            File::create(&path).unwrap();
+        }
+        let metadata = metadata(&file_path).unwrap();
+        return Segment {
+            file_path: file_path.clone(),
+            index: build_index(&file_path).unwrap(),
+            size: metadata.len(),
+        };
+    }
+}
+
+struct Environment {
+    data_path: String,
+    file_prefix: String,
+    segments: Vec<Segment>,
 }
 
 impl Environment {
-    pub fn new(file_path: &String) -> Self {
+    pub fn new(data_path: &String, prefix: &String) -> Self {
+        let paths = read_dir(data_path).unwrap();
+
+        let segments: Vec<Segment> = paths
+            .filter_map(|path| path.ok())
+            .filter(|p| p.file_name().into_string().unwrap().starts_with(prefix))
+            .map(|p| Segment::new(p.path().display().to_string()))
+            .collect();
+        
         return Environment {
-            file_path: file_path.clone(),
-            index: build_index(file_path).unwrap(),
+            data_path: data_path.clone(),
+            file_prefix: prefix.clone(),
+            segments: segments,
         };
+    }
+
+    pub fn next_file_name(&self) -> String {
+        let file_number: u64 = match self.segments.last() {
+            Some(segment) => u64::from_str_radix(segment.file_path.split('.').last().unwrap(), 10).unwrap(),
+            None => 0,
+        };
+        let path_to_file =
+            Path::new(&self.data_path).join(format!("{}.{:05}", self.file_prefix, file_number + 1));
+        return path_to_file.display().to_string();
     }
 }
 
@@ -34,16 +79,32 @@ fn build_index(file_path: &String) -> Result<HashMap<String, u64>, std::io::Erro
             .as_str(),
         );
         result.insert(line_key.to_string(), current_position);
-        current_position += real_line.len() as u64 + 1; // accounting newline here
+        current_position += real_line.len() as u64 + 1; // accounting for newline here
     }
     return Ok(result);
 }
 
 fn get_data(env: &Environment, key: &String) -> Result<String, std::io::Error> {
-    let file = OpenOptions::new().read(true).open(&env.file_path)?;
+    for segment in env.segments.iter().rev() {
+        match get_data_from_segment(segment, key) {
+            Ok(value) => {
+                if !value.is_empty() {
+                    return Ok(value);
+                }
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+    }
+    Ok(String::new())
+}
+
+fn get_data_from_segment(segment: &Segment, key: &String) -> Result<String, std::io::Error> {
+    let file = OpenOptions::new().read(true).open(&segment.file_path)?;
     let mut buf_reader = BufReader::new(file);
     let mut return_value = String::new();
-    match env.index.get(key) {
+    match segment.index.get(key) {
         Some(offset) => {
             let _ = buf_reader.seek(SeekFrom::Start(*offset as u64));
             let mut real_line = String::new();
@@ -68,17 +129,38 @@ fn get_data(env: &Environment, key: &String) -> Result<String, std::io::Error> {
 }
 
 fn set_data(env: &mut Environment, key: &String, value: &String) -> Result<(), std::io::Error> {
+    match env.segments.last() {
+        Some(segment) => {
+            if segment.size > SEGMENT_THRESHOLD {
+                let file_path = env.next_file_name();
+                env.segments.push(Segment::new(file_path));
+            }
+        }
+        None => {
+            let file_path = env.next_file_name();
+            env.segments.push(Segment::new(file_path));
+        }
+    };
+    set_data_to_segment(env.segments.last_mut().unwrap(), key, value)
+}
+
+fn set_data_to_segment(
+    segment: &mut Segment,
+    key: &String,
+    value: &String,
+) -> Result<(), std::io::Error> {
     let file = OpenOptions::new()
         .write(true)
         .append(true)
-        .open(&env.file_path)?;
+        .open(&segment.file_path)?;
     let mut writer = BufWriter::new(file);
     let line = format!("{},{}", key, value);
     writeln!(writer, "{}", line)?;
-    env.index.insert(
+    segment.index.insert(
         key.clone(),
         writer.stream_position()? - line.len() as u64 - 1,
     );
+    segment.size += line.len() as u64 + 1;
     Ok(())
 }
 
@@ -116,7 +198,8 @@ fn handle_command(env: &mut Environment, command_args: &Vec<String>) {
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     let is_interactive = args[0] == "--interactive";
-    let mut env = Environment::new(&String::from("./test.db"));
+    // TODO: create directory if not exists
+    let mut env = Environment::new(&String::from("./data/"), &String::from("db"));
     if !is_interactive {
         handle_command(&mut env, &args);
         return Ok(());
