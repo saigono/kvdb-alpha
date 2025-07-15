@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::env;
-use std::fs::{File, OpenOptions, metadata, read_dir, rename};
+use std::fs::{File, OpenOptions, metadata, read_dir, remove_file, rename};
 use std::io::{BufReader, BufWriter, Seek, stdin};
 use std::io::{SeekFrom, prelude::*};
 use std::path::Path;
@@ -27,6 +27,50 @@ impl Segment {
             index: build_index(&file_path).unwrap(),
             size: metadata.len(),
         };
+    }
+
+    pub fn get_data(&self, key: &String) -> Result<String, std::io::Error> {
+        let file = OpenOptions::new().read(true).open(&self.file_path)?;
+        let mut buf_reader = BufReader::new(file);
+        let mut return_value = String::new();
+        match self.index.get(key) {
+            Some(offset) => {
+                let _ = buf_reader.seek(SeekFrom::Start(*offset as u64));
+                let mut real_line = String::new();
+                let _ = buf_reader.read_line(&mut real_line)?;
+                let (line_key, val) = real_line.split_once(',').expect(
+                    format!(
+                        "Failed to split line [{}].\nCheck for db corruption",
+                        real_line
+                    )
+                    .as_str(),
+                );
+                if line_key == key {
+                    return_value = String::from(val);
+                    return_value.pop(); // remove endline
+                } else {
+                    panic!("index corrupted");
+                }
+            }
+            None => (),
+        };
+        Ok(return_value)
+    }
+
+    pub fn save_data(&mut self, key: &String, value: &String) -> Result<(), std::io::Error> {
+        let file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&self.file_path)?;
+        let mut writer = BufWriter::new(file);
+        let line = format!("{},{}", key, value);
+        writeln!(writer, "{}", line)?;
+        self.index.insert(
+            key.clone(),
+            writer.stream_position()? - line.len() as u64 - 1,
+        );
+        self.size += line.len() as u64 + 1;
+        Ok(())
     }
 }
 
@@ -64,12 +108,12 @@ impl Environment {
     }
 
     pub fn next_file_name(&self) -> String {
-        let file_number: u64 = match self.segments.last() {
-            Some(segment) => {
-                u64::from_str_radix(segment.file_path.split('.').last().unwrap(), 10).unwrap()
-            }
-            None => 0,
-        };
+        let file_number = self
+            .segments
+            .iter()
+            .map(|s| u64::from_str_radix(s.file_path.split('.').last().unwrap(), 10).unwrap())
+            .max()
+            .unwrap();
         let path_to_file =
             Path::new(&self.data_path).join(format!("{}.{:05}", self.file_prefix, file_number + 1));
         return path_to_file.display().to_string();
@@ -90,6 +134,36 @@ impl Environment {
         rename(&self.write_segment.file_path, &next_file_name).unwrap();
         self.segments.push(Segment::new(next_file_name));
         self.write_segment = Environment::new_write_segment(&self.data_path, &self.file_prefix);
+    }
+
+    pub fn compact_segments(&mut self) -> Result<(), std::io::Error> {
+        // This function is blocking an env, need to rewrite
+        let mut total_data: HashMap<String, String> = HashMap::new();
+        for segment in self.segments.iter() {
+            let file = OpenOptions::new().read(true).open(&segment.file_path)?;
+            let buf_reader = BufReader::new(file);
+            for line in buf_reader.lines() {
+                let real_line = line?;
+                let (line_key, val) = real_line.split_once(',').unwrap();
+                total_data.insert(line_key.to_string(), val.to_string());
+            }
+        }
+        let mut new_segments: Vec<Segment> = Vec::new();
+        let mut current_segment = Segment::new(self.next_file_name());
+        for (key, val) in total_data {
+            if current_segment.size > SEGMENT_THRESHOLD {
+                new_segments.push(current_segment);
+                current_segment = Segment::new(self.next_file_name());
+            }
+            current_segment.save_data(&key, &val)?;
+        }
+        new_segments.push(current_segment);
+        let filenames: Vec<String> = self.segments.iter().map(|s| s.file_path.clone()).collect();
+        for file_path in filenames {
+            remove_file(file_path)?;
+        }
+        self.segments = new_segments;
+        Ok(())
     }
 }
 
@@ -115,7 +189,7 @@ fn build_index(file_path: &String) -> Result<HashMap<String, u64>, std::io::Erro
 }
 
 fn get_data(env: &Environment, key: &String) -> Result<String, std::io::Error> {
-    match get_data_from_segment(&env.write_segment, key) {
+    match env.write_segment.get_data(key) {
         Ok(value) => {
             if !value.is_empty() {
                 return Ok(value);
@@ -126,7 +200,7 @@ fn get_data(env: &Environment, key: &String) -> Result<String, std::io::Error> {
         }
     }
     for segment in env.segments.iter().rev() {
-        match get_data_from_segment(segment, key) {
+        match segment.get_data(key) {
             Ok(value) => {
                 if !value.is_empty() {
                     return Ok(value);
@@ -140,65 +214,18 @@ fn get_data(env: &Environment, key: &String) -> Result<String, std::io::Error> {
     Ok(String::new())
 }
 
-fn get_data_from_segment(segment: &Segment, key: &String) -> Result<String, std::io::Error> {
-    let file = OpenOptions::new().read(true).open(&segment.file_path)?;
-    let mut buf_reader = BufReader::new(file);
-    let mut return_value = String::new();
-    match segment.index.get(key) {
-        Some(offset) => {
-            let _ = buf_reader.seek(SeekFrom::Start(*offset as u64));
-            let mut real_line = String::new();
-            let _ = buf_reader.read_line(&mut real_line)?;
-            let (line_key, val) = real_line.split_once(',').expect(
-                format!(
-                    "Failed to split line [{}].\nCheck for db corruption",
-                    real_line
-                )
-                .as_str(),
-            );
-            if line_key == key {
-                return_value = String::from(val);
-                return_value.pop(); // remove endline
-            } else {
-                panic!("index corrupted");
-            }
-        }
-        None => (),
-    };
-    Ok(return_value)
-}
-
 fn set_data(env: &mut Environment, key: &String, value: &String) -> Result<(), std::io::Error> {
     if env.write_segment.size > SEGMENT_THRESHOLD {
         env.retire_write_segment();
     }
-    set_data_to_segment(&mut env.write_segment, key, value)
-}
-
-fn set_data_to_segment(
-    segment: &mut Segment,
-    key: &String,
-    value: &String,
-) -> Result<(), std::io::Error> {
-    let file = OpenOptions::new()
-        .write(true)
-        .append(true)
-        .open(&segment.file_path)?;
-    let mut writer = BufWriter::new(file);
-    let line = format!("{},{}", key, value);
-    writeln!(writer, "{}", line)?;
-    segment.index.insert(
-        key.clone(),
-        writer.stream_position()? - line.len() as u64 - 1,
-    );
-    segment.size += line.len() as u64 + 1;
-    Ok(())
+    env.write_segment.save_data(key, value)
 }
 
 fn handle_command(env: &mut Environment, command_args: &Vec<String>) {
     let command = &command_args[0];
-    let key = &command_args[1];
     if command == "SET" {
+        let key = &command_args[1];
+
         let value = &command_args[2];
         let return_value = set_data(env, key, value);
         match return_value {
@@ -210,6 +237,8 @@ fn handle_command(env: &mut Environment, command_args: &Vec<String>) {
             }
         }
     } else if command == "GET" {
+        let key = &command_args[1];
+
         let return_value = get_data(env, key);
         match return_value {
             Ok(value) => {
@@ -221,6 +250,15 @@ fn handle_command(env: &mut Environment, command_args: &Vec<String>) {
             }
             Err(e) => {
                 println!("Could not find value for key [{}]. Error: [{}]", key, e);
+            }
+        }
+    } else if command == "COMPACT" {
+        match env.compact_segments() {
+            Ok(_) => {
+                println!("Segments compacted");
+            }
+            Err(e) => {
+                println!("Failed to compact segments: [{}]", e);
             }
         }
     }
