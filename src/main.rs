@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::env;
-use std::fs::{metadata, read_dir, File, OpenOptions};
+use std::fs::{File, OpenOptions, metadata, read_dir, rename};
 use std::io::{BufReader, BufWriter, Seek, stdin};
 use std::io::{SeekFrom, prelude::*};
 use std::path::Path;
 
 const SEGMENT_THRESHOLD: u64 = 256;
+const CURRENT_SEGMENT_SUFFIX: &str = "current";
 
 #[derive(Debug)]
 struct Segment {
@@ -33,33 +34,62 @@ struct Environment {
     data_path: String,
     file_prefix: String,
     segments: Vec<Segment>,
+    write_segment: Segment,
 }
 
 impl Environment {
     pub fn new(data_path: &String, prefix: &String) -> Self {
         let paths = read_dir(data_path).unwrap();
 
-        let segments: Vec<Segment> = paths
+        let mut segments: Vec<Segment> = paths
             .filter_map(|path| path.ok())
             .filter(|p| p.file_name().into_string().unwrap().starts_with(prefix))
             .map(|p| Segment::new(p.path().display().to_string()))
             .collect();
-        
+
+        let index = segments
+            .iter()
+            .position(|s| s.file_path.ends_with(CURRENT_SEGMENT_SUFFIX));
+
+        if index.is_some() {
+            segments.remove(index.unwrap());
+        }
+
         return Environment {
             data_path: data_path.clone(),
             file_prefix: prefix.clone(),
             segments: segments,
+            write_segment: Environment::new_write_segment(&data_path, &prefix),
         };
     }
 
     pub fn next_file_name(&self) -> String {
         let file_number: u64 = match self.segments.last() {
-            Some(segment) => u64::from_str_radix(segment.file_path.split('.').last().unwrap(), 10).unwrap(),
+            Some(segment) => {
+                u64::from_str_radix(segment.file_path.split('.').last().unwrap(), 10).unwrap()
+            }
             None => 0,
         };
         let path_to_file =
             Path::new(&self.data_path).join(format!("{}.{:05}", self.file_prefix, file_number + 1));
         return path_to_file.display().to_string();
+    }
+
+    fn new_write_segment(data_path: &String, file_prefix: &String) -> Segment {
+        Segment::new(
+            Path::new(data_path)
+                .join(format!("{}.{}", file_prefix, CURRENT_SEGMENT_SUFFIX))
+                .display()
+                .to_string(),
+        )
+    }
+
+    pub fn retire_write_segment(&mut self) {
+        // we have only one write thread, so this is fine
+        let next_file_name = self.next_file_name();
+        rename(&self.write_segment.file_path, &next_file_name).unwrap();
+        self.segments.push(Segment::new(next_file_name));
+        self.write_segment = Environment::new_write_segment(&self.data_path, &self.file_prefix);
     }
 }
 
@@ -85,6 +115,16 @@ fn build_index(file_path: &String) -> Result<HashMap<String, u64>, std::io::Erro
 }
 
 fn get_data(env: &Environment, key: &String) -> Result<String, std::io::Error> {
+    match get_data_from_segment(&env.write_segment, key) {
+        Ok(value) => {
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+        Err(e) => {
+            return Err(e);
+        }
+    }
     for segment in env.segments.iter().rev() {
         match get_data_from_segment(segment, key) {
             Ok(value) => {
@@ -129,19 +169,10 @@ fn get_data_from_segment(segment: &Segment, key: &String) -> Result<String, std:
 }
 
 fn set_data(env: &mut Environment, key: &String, value: &String) -> Result<(), std::io::Error> {
-    match env.segments.last() {
-        Some(segment) => {
-            if segment.size > SEGMENT_THRESHOLD {
-                let file_path = env.next_file_name();
-                env.segments.push(Segment::new(file_path));
-            }
-        }
-        None => {
-            let file_path = env.next_file_name();
-            env.segments.push(Segment::new(file_path));
-        }
-    };
-    set_data_to_segment(env.segments.last_mut().unwrap(), key, value)
+    if env.write_segment.size > SEGMENT_THRESHOLD {
+        env.retire_write_segment();
+    }
+    set_data_to_segment(&mut env.write_segment, key, value)
 }
 
 fn set_data_to_segment(
