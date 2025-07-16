@@ -7,6 +7,7 @@ use std::path::Path;
 
 const SEGMENT_THRESHOLD: u64 = 256;
 const CURRENT_SEGMENT_SUFFIX: &str = "current";
+const DELETE_TERMINATOR: &str = "";
 
 #[derive(Debug)]
 struct Segment {
@@ -14,6 +15,19 @@ struct Segment {
     index: HashMap<String, u64>,
     size: u64,
 }
+
+#[derive(Debug)]
+enum SegmentError {
+    Io(std::io::Error),
+    KeyDeleted,
+}
+
+impl From<std::io::Error> for SegmentError {
+    fn from(err: std::io::Error) -> SegmentError {
+        SegmentError::Io(err)
+    }
+}
+
 
 impl Segment {
     pub fn new(file_path: String) -> Self {
@@ -29,10 +43,11 @@ impl Segment {
         };
     }
 
-    pub fn get_data(&self, key: &String) -> Result<String, std::io::Error> {
+    pub fn get_data(&self, key: &String) -> Result<String, SegmentError> {
         let file = OpenOptions::new().read(true).open(&self.file_path)?;
         let mut buf_reader = BufReader::new(file);
         let mut return_value = String::new();
+        let mut found = false;
         match self.index.get(key) {
             Some(offset) => {
                 let _ = buf_reader.seek(SeekFrom::Start(*offset as u64));
@@ -48,12 +63,16 @@ impl Segment {
                 if line_key == key {
                     return_value = String::from(val);
                     return_value.pop(); // remove endline
+                    found = true;
                 } else {
                     panic!("index corrupted");
                 }
             }
             None => (),
         };
+        if found && return_value.is_empty() {
+            return Err(SegmentError::KeyDeleted);
+        }
         Ok(return_value)
     }
 
@@ -87,6 +106,7 @@ impl Environment {
 
         let mut segments: Vec<Segment> = paths
             .filter_map(|path| path.ok())
+            // TODO: do not build segment for CURRENT here
             .filter(|p| p.file_name().into_string().unwrap().starts_with(prefix))
             .map(|p| Segment::new(p.path().display().to_string()))
             .collect();
@@ -145,7 +165,11 @@ impl Environment {
             for line in buf_reader.lines() {
                 let real_line = line?;
                 let (line_key, val) = real_line.split_once(',').unwrap();
-                total_data.insert(line_key.to_string(), val.to_string());
+                if val.is_empty() {
+                    total_data.remove(&line_key.to_string());
+                } else {
+                    total_data.insert(line_key.to_string(), val.to_string());
+                }
             }
         }
         let mut new_segments: Vec<Segment> = Vec::new();
@@ -185,10 +209,11 @@ fn build_index(file_path: &String) -> Result<HashMap<String, u64>, std::io::Erro
         result.insert(line_key.to_string(), current_position);
         current_position += real_line.len() as u64 + 1; // accounting for newline here
     }
+    println!("Built index: file [{:#?}] index[{:#?}]", file_path, result);
     return Ok(result);
 }
 
-fn get_data(env: &Environment, key: &String) -> Result<String, std::io::Error> {
+fn get_data(env: &Environment, key: &String) -> Result<String, SegmentError> {
     match env.write_segment.get_data(key) {
         Ok(value) => {
             if !value.is_empty() {
@@ -227,6 +252,10 @@ fn handle_command(env: &mut Environment, command_args: &Vec<String>) {
         let key = &command_args[1];
 
         let value = &command_args[2];
+        if value.is_empty() {
+            println!("Empty value, ignoring");
+            return;
+        }
         let return_value = set_data(env, key, value);
         match return_value {
             Ok(_) => {
@@ -248,8 +277,13 @@ fn handle_command(env: &mut Environment, command_args: &Vec<String>) {
                     println!("Found value: [{}]", value);
                 }
             }
-            Err(e) => {
-                println!("Could not find value for key [{}]. Error: [{}]", key, e);
+            Err(e) => match e {
+                SegmentError::Io(e) => {
+                println!("Could not find value for key [{}]. Error: [{:?}]", key, e);
+                },
+                SegmentError::KeyDeleted => {
+                    println!("Value not found (actually deleted)");
+                }
             }
         }
     } else if command == "COMPACT" {
@@ -259,6 +293,17 @@ fn handle_command(env: &mut Environment, command_args: &Vec<String>) {
             }
             Err(e) => {
                 println!("Failed to compact segments: [{}]", e);
+            }
+        }
+    } else if command == "DELETE" {
+        let key = &command_args[1];
+        let return_value = set_data(env, key, &DELETE_TERMINATOR.to_string());
+        match return_value {
+            Ok(_) => {
+                println!("Deleted key: [{}]", key);
+            }
+            Err(e) => {
+                println!("Could not write key-value pair. Error: [{}]", e);
             }
         }
     }
