@@ -70,7 +70,7 @@ impl Segment {
             }
             None => (),
         };
-        if found && return_value.is_empty() {
+        if found && return_value == DELETE_TERMINATOR {
             return Err(SegmentError::KeyDeleted);
         }
         Ok(return_value)
@@ -165,7 +165,7 @@ impl Environment {
             for line in buf_reader.lines() {
                 let real_line = line?;
                 let (line_key, val) = real_line.split_once(',').unwrap();
-                if val.is_empty() {
+                if val == DELETE_TERMINATOR {
                     total_data.remove(&line_key.to_string());
                 } else {
                     total_data.insert(line_key.to_string(), val.to_string());
@@ -209,7 +209,6 @@ fn build_index(file_path: &String) -> Result<HashMap<String, u64>, std::io::Erro
         result.insert(line_key.to_string(), current_position);
         current_position += real_line.len() as u64 + 1; // accounting for newline here
     }
-    println!("Built index: file [{:#?}] index[{:#?}]", file_path, result);
     return Ok(result);
 }
 
